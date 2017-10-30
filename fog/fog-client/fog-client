@@ -1,0 +1,566 @@
+#!/usr/bin/python
+
+import argparse
+import os
+import sys
+
+from collections import namedtuple
+from functools import partial
+
+# TODO(infinity0): this is temporary workaround until we do #10047
+if sys.platform == 'win32':
+    os.environ["KILL_CHILDREN_ON_DEATH"] = "1"
+from pyptlib.util import parse_addr_spec
+from pyptlib.util.subproc import auto_killall, Popen
+from pyptlib.client import ClientTransportPlugin
+
+from subprocess import PIPE
+
+from twisted.internet.defer import Deferred, DeferredList
+from twisted.internet.error import CannotListenError
+from twisted.internet.stdio import StandardIO
+from twisted.internet.protocol import Factory, connectionDone
+from twisted.internet.endpoints import TCP4ClientEndpoint
+from twisted.protocols.basic import LineReceiver
+from twisted.protocols.portforward import ProxyServer as _ProxyServer
+from twisted.python import log
+from txsocksx.client import SOCKS4ClientEndpoint, SOCKS5ClientEndpoint
+from fog.socks import SOCKSv4InterceptorFactory
+
+import shlex
+
+import logging
+
+DEFAULT_CONFIG_FILE_NAME = os.path.dirname(os.path.realpath(__file__)) + '/fogrc'
+
+logger = None
+def pt_setup_logger():
+    global logger
+    logger = logging.getLogger('fog-logger')
+    logger.setLevel(logging.WARNING)
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.DEBUG)
+    logger.addHandler(ch)
+
+def pt_child_env(managed_ver, env=os.environ):
+    """
+    Prepare the environment for a child PT process, by clearing all TOR_PT_*
+    envvars and TOR_PT_MANAGED_TRANSPORT_VER.
+    """
+    cur_env = [(k, v) for k, v in env.iteritems()
+                      if not k.startswith('TOR_PT_')]
+    if 'TOR_PT_STATE_LOCATION' in env:
+        prev_pt_state_location = env['TOR_PT_STATE_LOCATION']
+        cur_env.append(('TOR_PT_STATE_LOCATION', os.path.join(prev_pt_state_location, 'fog')))
+    cur_env.append(('TOR_PT_MANAGED_TRANSPORT_VER', ','.join(managed_ver)))
+    return cur_env
+
+class MethodSpec(namedtuple('MethodSpec', 'name protocol addrport args opts')):
+    @classmethod
+    def fromLine(cls, line):
+        args = line.rstrip('\n').split(' ')
+        name = args[0]
+        protocol = args[1]
+        addrport = parse_addr_spec(args[2])
+        args = args[3][-5:].split(',') if len(args) > 3 and args[3].startswith("ARGS=") else []
+        opts = args[4][-9:].split(',') if len(args) > 4 and args[4].startswith("OPT-ARGS=") else []
+        return MethodSpec(name, protocol, addrport, args, opts)
+
+def branch(parent):
+    """
+    Returns a new Deferred that does not advance the callback-chain of the parent.
+
+    See http://xph.us/2009/12/10/asynchronous-programming-in-python.html for motivation.
+    """
+    d = Deferred()
+    parent.addCallback(lambda v: (v, d.callback(v))[0])
+    parent.addErrback(lambda f: (f, d.errback(f))[1])
+    return d
+
+class ManagedTransportProtocolV1(LineReceiver):
+    """
+    A Twisted IProtocol to read PT output.
+
+    See pt-spec.txt and others for details of the protocol.
+    """
+    # TODO(infinity0): eventually this could be padded out and moved to pyptlib
+
+    delimiter = os.linesep
+    protocol_version = "1"
+
+    def __init__(self):
+        self.cmethods = {}
+        self._dCMethodsDone = Deferred()
+        self._dPluginError = Deferred()
+        # dPluginError triggers errors on all sub-events, not the other way round
+        # so fatal sub-events should call _abort rather than errback on their Deferreds
+        self._dPluginError.addErrback(lambda f: (f, self._fireCMethodsDone().errback(f))[0])
+        # TODO(infinity0): call _abort if we don't recv CMETHODS DONE within n sec
+
+    def whenCMethodsDone(self):
+        """
+        Return a new Deferred that calls-back when CMETHODS DONE is received.
+        """
+        return branch(self._dCMethodsDone)
+
+    def whenPluginError(self):
+        """
+        Return a new Deferred that errors-back when the remote plugin fails.
+
+        Note: the success chain (callback) is never fired.
+        """
+        return branch(self._dPluginError)
+
+    def lineReceived(self, line):
+        if not line: return
+
+        (kw, args) = line.split(' ', 1)
+        if kw == "VERSION":
+            version = args.strip()
+            if version != self.protocol_version:
+                self._abort(ValueError("child used unsupported managed transport version: %s" % version))
+        elif kw == "CMETHOD":
+            cmethod = MethodSpec.fromLine(args)
+            self.cmethods[cmethod.name] = cmethod
+        elif kw == "CMETHODS" and args == "DONE":
+            self._fireCMethodsDone().callback(self.cmethods)
+        else:
+            pass # ignore unrecognised line
+
+    def connectionLost(self, reason=connectionDone):
+        self._firePluginError().errback(reason)
+
+    def _abort(self, exc):
+        self._firePluginError().errback(exc)
+        self.transport.loseConnection()
+
+    def _fireCMethodsDone(self):
+        """Return dCMethodsDone or a dummy if it was already called."""
+        if self._dCMethodsDone:
+            d = self._dCMethodsDone
+            self._dCMethodsDone = None
+            return d
+        return Deferred().addErrback(lambda *args: None)
+
+    def _firePluginError(self):
+        """Return dPluginError or a dummy if it was already called."""
+        if self._dPluginError:
+            d = self._dPluginError
+            self._dPluginError = None
+            return d
+        return Deferred().addErrback(lambda *args: None)
+
+# TODO(infinity0): remove this class when twisted update their side
+class ProxyServer(_ProxyServer):
+
+    def connectionMade(self):
+        # code copied from super class, except instead of connecting
+        # to a TCP endpoint we abstract that out to a child method
+        self.transport.pauseProducing()
+
+        client = self.clientProtocolFactory()
+        client.setServer(self)
+
+        if self.reactor is None:
+            from twisted.internet import reactor
+            self.reactor = reactor
+
+        self.connectProxyClient(client)
+
+    def connectProxyClient(self, client):
+        raise NotImplementedError()
+
+class OneUseSOCKSWrapper(ProxyServer):
+
+    def connectProxyClient(self, client):
+        local_host, local_port = self.factory.method_spec.addrport
+        TCPPoint = TCP4ClientEndpoint(
+            self.reactor,
+            local_host,
+            local_port)
+        # Next PT may need either SOCKS4 or SOCKS5 so check its protocol and get the required class
+        socks_endpoint_class = self.getSocksEndpointClass()
+        SOCKSPoint = socks_endpoint_class(
+                    self.factory.remote_host,
+                    self.factory.remote_port,
+                    TCPPoint)
+        # Store port for debugging messages before stopListening is called.
+        # listen_port will not have a port after stopListening is called.
+        stored_port = self.factory.listen_port.getHost().port
+        d_port_closed = self.factory.listen_port.stopListening()
+        d_port_closed.addCallback(
+            lambda x: logger.debug("Closed factory listener %s on port %s" % (self.factory, stored_port)))
+        d_port_closed.addErrback(
+            lambda x: logger.warn("Failed to close factory listener %s listening on port %s" % (self.factory, stored_port)))
+        d = SOCKSPoint.connect(client)
+        d.chainDeferred(self.factory.d_connected)
+        @d.addErrback
+        def _gotError(error):
+            log.err(error, "error connecting to SOCKS server")
+
+    def getSocksEndpointClass(self):
+        """
+        Checks self.factory.method_spec.protocol and returns the appropriate socks endpoint class.
+        """
+        socks_endpoint_class = None
+        if self.factory.method_spec.protocol == 'socks4':
+            socks_endpoint_class = SOCKS4ClientEndpoint
+        elif self.factory.method_spec.protocol == 'socks5':
+            socks_endpoint_class = SOCKS5ClientEndpoint
+        else:
+            raise ValueError("Pluggable transport requires unknown protocol %s. Supported protocols are %s" %
+                            (self.factory.method_spec.protocol, ('socks4', 'socks5')))
+        return socks_endpoint_class
+
+class OneUseSOCKSFactory(Factory):
+    protocol = OneUseSOCKSWrapper
+    def __init__(self, method_spec, dest_addr_port):
+        self._connected_once = False
+        self.method_spec = method_spec
+        self.remote_host = dest_addr_port[0]
+        self.remote_port = dest_addr_port[1]
+        self.d_connected = Deferred()
+        self.listen_port = None
+
+    def __str__(self):
+        return "OneUseSOCKSFactory connecting %s to %s:%s" % (self.method_spec, self.remote_host, self.remote_port)
+
+    def __repr__(self):
+        return "OneUseSOCKSFactory(%s, %s, %s)" % (self.method_spec, self.remote_host, self.remote_port)
+
+    def setListenPort(self, listen_port):
+        """
+        Sets the listen_port object.
+        :param function listen_port: The function returned from a ListenTCP call. Used to shutdown the port when a connection is made.
+        """
+        self.listen_port = listen_port
+
+    def whenConnected(self):
+        """
+        Returns a new Deferred that triggers when a connection is successfully made.
+        """
+        return branch(self.d_connected)
+
+    def buildProtocol(self, addr):
+        """
+        Only allows one protocol to be created. After that it always returns None
+        :param twisted.internet.interfaces.IAddress addr: an object implementing L{twisted.internet.interfaces.IAddress}
+        """
+        if self._connected_once:
+            return None
+        else:
+            self._connected_once = True
+            return Factory.buildProtocol(self, addr)
+
+if sys.platform == "win32":
+    # TODO(infinity0): push this upstream to Twisted
+    from twisted.internet import _pollingfile
+    import msvcrt
+
+    _StandardIO = StandardIO
+    class StandardIO(_StandardIO):
+
+        def __init__(self, proto, stdin=None, stdout=None, reactor=None):
+            """
+            Start talking to standard IO with the given protocol.
+
+            Also, put it stdin/stdout/stderr into binary mode.
+            """
+            if reactor is None:
+                import twisted.internet.reactor
+                reactor = twisted.internet.reactor
+
+            _pollingfile._PollingTimer.__init__(self, reactor)
+            self.proto = proto
+
+            fdstdin = stdin or sys.stdin.fileno()
+            fdstdout = stdout or sys.stdout.fileno()
+
+            for stdfd in (fdstdin, fdstdout):
+                msvcrt.setmode(stdfd, os.O_BINARY)
+
+            hstdin = msvcrt.get_osfhandle(fdstdin)
+            self.stdin = _pollingfile._PollableReadPipe(
+                hstdin, self.dataReceived, self.readConnectionLost)
+
+            hstdout = msvcrt.get_osfhandle(fdstdout)
+            self.stdout = _pollingfile._PollableWritePipe(
+                hstdout, self.writeConnectionLost)
+
+            self._addPollableResource(self.stdin)
+            self._addPollableResource(self.stdout)
+
+            self.proto.makeConnection(self)
+
+def pt_launch_child(reactor, client, methodnames, chain_names, cmdline):
+    """Launch a child PT and ensure it has the right transport methods."""
+    cur_env = pt_child_env(ManagedTransportProtocolV1.protocol_version)
+    environment = dict(cur_env + {
+            "TOR_PT_CLIENT_TRANSPORTS": ",".join(methodnames),
+        }.items())
+    sub_proc = Popen(cmdline,
+        stdout = PIPE,
+        env = environment,
+        )
+    sub_protocol = ManagedTransportProtocolV1()
+    # we ought to pass reactor=reactor in below, but this breaks Twisted 12
+    StandardIO(sub_protocol, stdin=sub_proc.stdout.fileno())
+    methoddefers = [sub_protocol.whenCMethodsDone().addCallback(
+                        partial(pt_require_child, client, name, chain_names))
+                    for name in methodnames]
+    return sub_proc, sub_protocol, methoddefers
+
+def pt_require_child(client, childmethod, chain_names, cmethods):
+    """Callback for checking a child PT has the right transport methods."""
+    if childmethod not in cmethods:
+        for chain_name in chain_names:
+            client.reportMethodError(chain_name, "failed to start required child transport: %s" % childmethod)
+        raise ValueError()
+    return cmethods[childmethod]
+
+def pt_get_unique_transport_list(aliases, config):
+    """
+    Returns all the pts needed by the chains without duplicates
+    :param aliases list: The list of alias names requested by tor and intersected with the transports fog can serve
+    :param Config config: The configuration object
+    """
+    uniq_transports = set()
+    for alias in aliases:
+        for pt_name in config.alias_map[alias]:
+            uniq_transports.add(pt_name)
+    return list(uniq_transports)
+
+def pt_setup_transports(reactor, client, configuration, pt_names, chain_names):
+    """
+    Sets up the pluggable transports needed by the chains
+    :param twisted.internet.interfaces.IReactor reactor: Reactor to install this PT to.
+    :param pyptlib.client.ClientTransportPlugin client: PT client API.
+    :param Config configuration: The configuration object.
+    :param list pt_names: The list of pt names to setup.
+    :param list chain_names: The list of chain names to launch.
+    """
+    pt_defer_map = {}
+    for pt_name in pt_names:
+        if pt_name not in configuration.transport_map:
+            raise ValueError("Pluggable transport %s not found in transport_map. Check your configuration file." % pt_name)
+        pt_cmdline = configuration.transport_map[pt_name]
+        # TODO make this more than a one item list when fixing multiple transports launched by one ClientTransportPlugin line.
+        multi_pts = [pt_name]
+        # Find all the chains where this pt is used.
+        pt_chains = [chain_name for chain_name in chain_names if pt_name in configuration.alias_map[chain_name]]
+        _, _, defers = pt_launch_child(reactor, client, multi_pts, pt_chains, pt_cmdline)
+        for pt, defer in zip(multi_pts, defers):
+            pt_defer_map[pt] = defer
+    chains_finished_dlist = pt_setup_chains(reactor, client, configuration, chain_names, pt_defer_map)
+    chains_finished_dlist.addCallback(lambda x: client.reportMethodsEnd())
+
+def pt_setup_chains(reactor, client, configuration, chain_names, pt_defer_map):
+    """
+    Sets up each chain of pluggable transports
+    :param twisted.internet.interfaces.IReactor reactor: Reactor to install this PT to.
+    :param pyptlib.client.ClientTransportPlugin client: PT client API.
+    :param Config configuration: The configuration object.
+    :param list chain_names: The list of chain names to setup.
+    :param dict pt_defer_map: A map between each pt and the defer that will callback when the pt is successfully launched.
+    """
+    all_chains_defer_list = []
+    for chain_name in chain_names:
+        chain = configuration.alias_map[chain_name]
+        if len(chain) < 2:
+            raise ValueError("PT Chain %s does not contain enough transports." % chain)
+        chain_deferred_list = DeferredList([pt_defer_map[pt] for pt in set(chain)])
+        partial_funct = partial(pt_launch_interceptor, reactor, client, configuration, chain_name)
+        chain_deferred_list.addCallback(partial_funct)
+        all_chains_defer_list.append(chain_deferred_list)
+    return DeferredList(all_chains_defer_list)
+
+def pt_setup_socks_shim(pt_name, pt_chain, success_list, dest_addr_port, reactor, proxy_deferreds):
+    """
+    Launches a socks proxy server to link two PTs together.
+    :param str pt_name: The name of the pt to send traffic to.
+    :param list pt_chain: The list of PTs in this chain.
+    :param list success_list: A list of tuples containing a launch status boolean, MethodSpec pairs.
+        Ex: [(True, MethodSpec(name='dummy', protocol='socks4', addrport=('127.0.0.1', 58982), args=[], opts=[])),
+            (True, MethodSpec(name='b64', protocol='socks4', addrport=('127.0.0.1', 58981), args=[], opts=[]))]
+    :param tuple dest_addr_port: The bridge address:port pair for the next PT to send its results to.
+    :param twisted.internet.interfaces.IReactor reactor: Reactor to attack the TCP server to.
+
+    :param list proxy_deferreds: This list has each factorys' deferred appended to it.
+
+    :returns twisted.internet.interfaces.IListeningPort: An IListeningPort used for shutting down a factory after a connection is made.
+    """
+    methodspec = [r[1] for r in success_list if r[1].name == pt_name][0] # Returns the resulting methodspec.
+    factory = OneUseSOCKSFactory(methodspec, dest_addr_port)
+    # TODO switch to using endpoints instead of listenTCP
+    proxy_server = reactor.listenTCP(interface='127.0.0.1', port=0, factory=factory)
+    factory.setListenPort(proxy_server)
+    proxy_deferreds.append(factory.whenConnected())
+    logger.debug("launched %s on port %s with dest %s" % (pt_name, proxy_server.getHost().port, dest_addr_port))
+    return proxy_server
+
+def pt_launch_chain(dest_addr_port, pt_chain, _chain_set_up, reactor, success_list):
+    """
+    Launches a chain of pluggable transports by connecting each pt with SOCKS proxies.
+    :param tuple dest_addr_port: The bridge address:port pair to connect to.
+    :param list pt_chain: The list of pt names to launch.
+    :param function _chain_set_up: The function to call when the shims have been set up.
+    :param twisted.internet.interfaces.IReactor reactor: Reactor to install this PT to.
+    :param list success_list: A list of tuples containing a launch status boolean, MethodSpec pairs.
+        Ex: [(True, MethodSpec(name='dummy', protocol='socks4', addrport=('127.0.0.1', 58982), args=[], opts=[])),
+            (True, MethodSpec(name='b64', protocol='socks4', addrport=('127.0.0.1', 58981), args=[], opts=[]))]
+    """
+    proxy_deferreds = []
+    last_pt_name = pt_chain[-1]
+    logger.debug("launching chain %s" % pt_chain)
+    # Initialize prev_server to the port picked by the last proxy server as that's the only one we know yet.
+    last_server = pt_setup_socks_shim(last_pt_name, pt_chain, success_list, dest_addr_port,
+                                    reactor, proxy_deferreds)
+    prev_server = last_server
+    for pt_name in reversed(pt_chain[:-1]):
+        # Loops through the pts linking them together through SOCKS proxies, skipping the last pt.
+        prev_server = pt_setup_socks_shim(pt_name, pt_chain, success_list, ('127.0.0.1', prev_server.getHost().port),
+                                        reactor, proxy_deferreds)
+    def check_chain_all_connected(protocol_list):
+        """
+        Checks all the shims launched to see if they successfully connected.
+        :param list protocol_list: A list of tuples containing status boolean, twisted.protocols.portforward.ProxyClient pairs.
+            Ex: [(True, <twisted.protocols.portforward.ProxyClient instance at 0x10b825518>),
+                 (True, <twisted.protocols.portforward.ProxyClient instance at 0x10b829518>)]
+        """
+        if all([result[0] for result in protocol_list]):
+            logger.debug("All PT shims connected correctly")
+        else:
+            # At this point the SOCKS protocol is in communication mode so no need to call makeReply(91)
+            # This assumes that the child pluggable transport will shut down the connection cleanly.
+            failed_protocols = [x[1] for x in protocol_list if x[0] == False]
+            logger.error("Shims %s failed to connect." % failed_protocols)
+            raise ValueError()
+
+    finished = DeferredList(proxy_deferreds)
+    finished.addCallback(check_chain_all_connected)
+    _chain_set_up((prev_server.getHost().host, prev_server.getHost().port))
+
+def pt_launch_interceptor(reactor, client, configuration, pt_method_name, success_list):
+    """
+    Launches a SOCKS interceptor.
+    :param twisted.internet.interfaces.IReactor reactor: Reactor to install this PT to.
+    :param pyptlib.client.ClientTransportPlugin client: PT client API.
+    :param Config configuration: The configuration structure for this pair.
+    :param str pt_method_name: The name of the pt chain to launch. Ex: "obfs3_flashproxy"
+    :param list success_list: A list of tuples containing a launch status boolean, MethodSpec pairs.
+        Ex: [(True, MethodSpec(name='dummy', protocol='socks4', addrport=('127.0.0.1', 58982), args=[], opts=[])),
+            (True, MethodSpec(name='b64', protocol='socks4', addrport=('127.0.0.1', 58981), args=[], opts=[]))]
+    """
+    logger.debug("launching interceptor for %s" % pt_method_name)
+    pt_chain = configuration.alias_map[pt_method_name]
+    success = all(r[0] for r in success_list if r[1].name in pt_chain)
+    # failure was already reported by pt_require_child, just return
+    if not success: return
+    socks_interceptor = SOCKSv4InterceptorFactory(pt_method_name,
+                        lambda dest_addr_port, pt_method_name, chain_finished:
+                            pt_launch_chain(dest_addr_port, pt_chain, chain_finished, reactor, success_list))
+    # TODO switch to using endpoints instead of listenTCP
+    try:
+        interceptor = reactor.listenTCP(interface='127.0.0.1', port=0, factory=socks_interceptor)
+        interceptor_port = interceptor.getHost().port
+    except CannotListenError:
+        client.reportMethodError(pt_method_name, "failed to launch SOCKS interceptor. The interceptor listenTCP failed.")
+        return
+    client.reportMethodSuccess(pt_method_name, "socks4", ("127.0.0.1", interceptor_port))
+
+class Config():
+    # Transport map links a pluggable transport name to the a commandline to launch it.
+    # Ex: {'b64' : 'exec obfsproxy managed'}
+    transport_map = None
+
+    #Alias map links a pluggable transport chain name to a list of individual pluggable transports
+    # Ex: {'dummy_b64_dummy2' : ['dummy''b64''dummy2']}
+    alias_map = None
+
+    def __init__(self, transport_map, alias_map):
+        self.transport_map = transport_map
+        self.alias_map = alias_map
+
+    def __repr__(self):
+        return "Config(%s, %s)" % (self.transport_map, self.alias_map)
+
+    def __str__(self):
+        return "Config Object with transport_map: %s, and alias_map %s." % (self.transport_map, self.alias_map)
+
+    @classmethod
+    def parse(cls, config_string):
+        """
+        Reads a configuration string and returns an instance of configuration. Uses shlex to parse configuration lines.
+        :param str config_string: The string which will be parsed to populate the transport_map and alias_map hash tables.
+        See the file example-fog-config for format.
+        """
+        # TODO Add possibility of reading a ClientTransportPlugin with multiple transport types
+        # Ex: ClientTransportPlugin obfs3,scramblesuit obfsclient --option=value
+
+        line_counter = 0
+        lines = config_string.split('\n')
+        transport_map = {}
+        alias_map = {}
+
+        for line in lines:
+            line_counter += 1
+            if len(line) > 0 and line[0] != '#' : # Check for empty lines and comment tags on the first
+                line = line.strip()
+                delimited_tokens = shlex.split(line)
+                if len(delimited_tokens) > 1:
+                    config_line_type = delimited_tokens[0] # This can be either Alias or ClientTransportPlugin
+                    if config_line_type == 'ClientTransportPlugin':
+                        cls.parse_transport_line(transport_map, delimited_tokens, line_counter)
+                    elif config_line_type == 'Alias':
+                        cls.parse_alias_line(alias_map, transport_map, delimited_tokens, line_counter)
+                    else:
+                        logger.warn("Configuration file has unknown line %s: '%s'" % (line_counter, line))
+        return cls(transport_map, alias_map)
+
+    @classmethod
+    def parse_transport_line(cls, transport_map, delimited_tokens, line_counter):
+        transport_name = delimited_tokens[1]
+        transport_cmdline = delimited_tokens[2:]
+        if transport_name in transport_map:
+            raise ValueError('Configuration file has duplicate ClientTransportPlugin lines. Duplicate line is at line number %s' % line_counter)
+        transport_map[transport_name] = transport_cmdline
+
+    @classmethod
+    def parse_alias_line(cls, alias_map, transport_map, delimited_tokens, line_counter):
+        alias_name = delimited_tokens[1] # Example: "obfs3_flashproxy"
+        alias_path = delimited_tokens[2].split('|') # Example: "obfs3|flashproxy"
+        if alias_name in alias_map:
+            raise ValueError('Configuration file has duplicate Alias lines. Duplicate line is at line number %s' % line_counter)
+        for pt_name in alias_path:
+            if pt_name not in transport_map:
+                raise KeyError('Transport map is missing pluggable transport %s needed for chain %s. Check your configuration file for a ClientTransportPlugin line can launch %s' % (pt_name, alias_name, pt_name))
+        alias_map[alias_name] = alias_path
+
+def main(*args):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-f", help="fog configuration file path",
+        metavar='FOGFILE', type=argparse.FileType('r'), default=DEFAULT_CONFIG_FILE_NAME)
+
+    pt_setup_logger()
+    # TODO(infinity0): add an "external" mode, which would require us to run
+    # obfsproxy in external mode too.
+
+    opts = parser.parse_args(args)
+    configuration = None
+    file_contents = opts.f.read()
+    configuration = Config.parse(file_contents)
+    pt_method_names = configuration.alias_map.keys()
+    client = ClientTransportPlugin()
+    client.init(pt_method_names) # Initialize our possible methods to all the chains listed by the fog file and stored in alias map.
+    if not client.getTransports():
+        logger.error("no transports to serve. pt_method_names may be invalid.")
+        return 1
+    pt_method_names = pt_get_unique_transport_list(client.getTransports(), configuration)
+    from twisted.internet import reactor
+    auto_killall(1, cleanup=reactor.stop)
+    pt_setup_transports(reactor, client, configuration, pt_method_names, client.getTransports())
+    reactor.run(installSignalHandlers=0)
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main(*sys.argv[1:]))

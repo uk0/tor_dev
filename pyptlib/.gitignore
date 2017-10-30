@@ -1,0 +1,15 @@
+# ignore compiled stuff
+*.py[cod]
+
+# ignore sphinx build stuff
+sphinx/_build/
+sphinx/pyptlib.*
+sphinx/modules.rst
+
+# ignore finished sphinx stuff
+doc/
+
+
+build/
+dist/
+*egg-info

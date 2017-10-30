@@ -1,0 +1,69 @@
+'\" t
+.\"     Title: websocket-server
+.\"    Author: [FIXME: author] [see http://docbook.sf.net/el/author]
+.\" Generator: DocBook XSL Stylesheets v1.78.1 <http://docbook.sf.net/>
+.\"      Date: 12/18/2015
+.\"    Manual: \ \&
+.\"    Source: \ \&
+.\"  Language: English
+.\"
+.TH "WEBSOCKET\-SERVER" "1" "12/18/2015" "\ \&" "\ \&"
+.\" -----------------------------------------------------------------
+.\" * Define some portability stuff
+.\" -----------------------------------------------------------------
+.\" ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+.\" http://bugs.debian.org/507673
+.\" http://lists.gnu.org/archive/html/groff/2009-02/msg00013.html
+.\" ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+.ie \n(.g .ds Aq \(aq
+.el       .ds Aq '
+.\" -----------------------------------------------------------------
+.\" * set default formatting
+.\" -----------------------------------------------------------------
+.\" disable hyphenation
+.nh
+.\" disable justification (adjust text to left margin only)
+.ad l
+.\" -----------------------------------------------------------------
+.\" * MAIN CONTENT STARTS HERE *
+.\" -----------------------------------------------------------------
+.SH "NAME"
+websocket-server \- WebSocket pluggable transport server
+.SH "SYNOPSIS"
+.sp
+\fBwebsocket\-server\fR [\fIOPTIONS\fR]
+.SH "DESCRIPTION"
+.sp
+websocket\-server is a transport plugin for Tor that uses the WebSocket protocol\&. It is the server component of the flash proxy system\&.
+.sp
+Configuration for websocket\-server usually appears in a torrc file\&. Here is a sample configuration:
+.sp
+.if n \{\
+.RS 4
+.\}
+.nf
+ExtORPort auto
+ServerTransportPlugin websocket exec /usr/local/bin/websocket\-server \-\-port 9901
+.fi
+.if n \{\
+.RE
+.\}
+.SH "OPTIONS"
+.PP
+\fB\-\-log\fR=\fIFILENAME\fR
+.RS 4
+Name of a file to write log messages to (default stderr)\&.
+.RE
+.PP
+\fB\-\-port\fR=\fIPORT\fR
+.RS 4
+Port to listen on\&. Overrides the TOR_PT_SERVER_BINDADDR environment variable set by tor\&.
+.RE
+.PP
+\fB\-h\fR, \fB\-\-help\fR
+.RS 4
+Display a help message and exit\&.
+.RE
+.SH "BUGS"
+.sp
+Please report at \fBhttps://trac\&.torproject\&.org/projects/tor\fR\&.

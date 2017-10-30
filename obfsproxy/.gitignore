@@ -1,0 +1,23 @@
+py-obfsproxy.sublime-project
+py-obfsproxy.sublime-workspace
+pytidy.py
+tidy.py
+tidyall
+pyvalidate.py
+validateAll
+.DS_Store
+py-obfsproxy.xcodeproj/*
+py-obfsproxy.xcodeproj/
+build/*
+dist/*
+py2exe_bundle
+obfsproxy.egg-info/*
+*.pyc
+src/obfsproxy/*.pyc
+MANIFEST
+
+# emacs swap files:
+*~
+# vim swap files:
+*.swp
+*.swo

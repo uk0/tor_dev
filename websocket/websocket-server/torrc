@@ -1,0 +1,6 @@
+BridgeRelay 1
+ORPort 9001
+ExtORPort auto
+SocksPort 0
+ServerTransportPlugin websocket exec ./websocket-server --log websocket-server.log --port 9901
+ExitPolicy reject *:*

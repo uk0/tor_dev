@@ -1,0 +1,6 @@
+This system was used to build the 2.x series of pluggable transports
+bundles. It is no longer used since the 3.x series as pluggable
+transports used the same Gitian-based system as the rest of the bundle.
+
+You want
+https://gitweb.torproject.org/builders/tor-browser-bundle.git/tree/gitian/README.build

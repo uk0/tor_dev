@@ -1,0 +1,100 @@
+== Creating a Debian VM
+
+Set up Debian VMs for building bundles. You need one for i386 and one
+for amd64. (Replace "X.X.X" with the current version number.)
+
+http://cdimage.debian.org/debian-cd/current/i386/iso-cd/debian-X.X.X-i386-netinst.iso
+http://cdimage.debian.org/debian-cd/current/i386/iso-cd/SHA256SUMS
+http://cdimage.debian.org/debian-cd/current/i386/iso-cd/SHA256SUMS.sign
+
+http://cdimage.debian.org/debian-cd/current/amd64/iso-cd/debian-X.X.X-amd64-netinst.iso
+http://cdimage.debian.org/debian-cd/current/amd64/iso-cd/SHA256SUMS
+http://cdimage.debian.org/debian-cd/current/amd64/iso-cd/SHA256SUMS.sign
+
+Verify the digests.
+	http://www.debian.org/CD/verify
+If you are using Debian, you can get the signing key by installing the
+debian-keyring package (apt-get install debian-keyring). Add
+	--keyring /usr/share/keyrings/debian-role-keys.gpg
+to the gpg --verify command.
+
+	$ gpg --verify SHA256SUMS.sign SHA256SUMS
+
+	$ sha256sum debian-X.X.X-i386-netinst.iso
+	$ grep netinst SHA256SUMS
+
+	$ sha256sum debian-X.X.X-amd64-netinst.iso
+	$ grep netinst SHA256SUMS
+
+Create the disk images.
+
+	$ qemu-img create -f qcow2 debian-i386-bundle.hda 10G
+	$ qemu-img create -f qcow2 debian-amd64-bundle.hda 10G
+
+Then boot the VM. You need your normal user to be in the "kvm" group for
+this to work (sudo usermod -a -G kvm user).
+
+	$ kvm -hda debian-i386-bundle.hda -cdrom debian-X.X.X-i386-netinst.iso
+	$ kvm -hda debian-amd64-bundle.hda -cdrom debian-X.X.X-amd64-netinst.iso
+
+Choose "Install" when it boots. Here are settings:
+
+	English
+	United States
+	American English
+	Hostname: debian
+	Domain name:
+	Root password:
+	User full name: bundle
+	User name: bundle
+	User password: password
+	Any time zone
+	Guided - use entire disk
+	All files in one partition
+	Any mirror
+	popularity-contest: no
+	Software select: uncheck all but "Standard system utilities"
+	GRUB on MBR: yes
+
+Packages to install:
+
+	$ sudo apt-get install --no-install-recommends git make zip
+	$ sudo apt-get install --no-install-recommends python-argparse python-crypto python-m2crypto python-setuptools python-twisted
+
+Get checkouts of pluggable transports and this bundle repository.
+
+	$ cd
+	$ git clone https://git.torproject.org/pluggable-transports/bundle.git
+	$ git clone https://git.torproject.org/pluggable-transports/pyptlib.git
+	$ git clone https://git.torproject.org/pluggable-transports/obfsproxy.git
+	$ git clone https://git.torproject.org/flashproxy.git
+
+== Browser bundle
+
+Update your Debian.
+
+	$ sudo apt-get update
+	$ sudo apt-get upgrade
+
+Update pluggable transport checkouts.
+
+	$ cd ~/bundle && git pull
+	$ cd ~/pyptlib && git pull
+	$ cd ~/obfsproxy && git pull
+	$ cd ~/flashproxy && git pull
+
+Edit the top of Makefile to set the version numbers you want to use.
+	BUNDLE_VERSION = ...
+	BUNDLE_RELEASE = ...
+	PT_BUNDLE_RELEASE = pt1
+The latest Tor Browser Bundle version number can be found at
+https://www.torproject.org/projects/torbrowser.html.en (search for
+"Alpha Releases"). PT_BUNDLE_RELEASE release should increment each time
+you build a new bundle with the same BUNDLE_VERSION and BUNDLE_RELEASE,
+and be reset to "pt1" when either of those change.
+
+Run one of these two commands, depending on the platform:
+	$ make gnulinux-i686
+	$ make gnulinux-x86_64
+
+Test running the bundle.

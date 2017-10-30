@@ -1,0 +1,42 @@
+// This file is asciidoc source code.
+// To generate manpages, use the a2x command i.e.
+// a2x --no-xmllint -d manpage -f manpage websocket-server.1.txt
+// see http://www.methods.co.nz/asciidoc/userguide.html#X1
+WEBSOCKET-SERVER(1)
+===================
+
+NAME
+----
+websocket-server - WebSocket pluggable transport server
+
+SYNOPSIS
+--------
+**websocket-server** [__OPTIONS__]
+
+DESCRIPTION
+-----------
+websocket-server is a transport plugin for Tor that uses the WebSocket
+protocol. It is the server component of the flash proxy system.
+
+Configuration for websocket-server usually appears in a torrc file. Here
+is a sample configuration:
+----
+ExtORPort auto
+ServerTransportPlugin websocket exec /usr/local/bin/websocket-server --port 9901
+----
+
+OPTIONS
+-------
+**--log**=__FILENAME__::
+    Name of a file to write log messages to (default stderr).
+
+**--port**=__PORT__::
+    Port to listen on. Overrides the TOR_PT_SERVER_BINDADDR environment
+    variable set by tor.
+
+**-h**, **--help**::
+    Display a help message and exit.
+
+BUGS
+----
+Please report at **https://trac.torproject.org/projects/tor**.

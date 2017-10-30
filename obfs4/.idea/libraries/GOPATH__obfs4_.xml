@@ -1,0 +1,22 @@
+<component name="libraryTable">
+  <library name="GOPATH &lt;obfs4&gt;">
+    <CLASSES>
+      <root url="file://$USER_HOME$/home/GO_LIB/src/k8s.io" />
+      <root url="file://$USER_HOME$/home/GO_LIB/src/git.torproject.org" />
+      <root url="file://$USER_HOME$/home/GO_LIB/src/github.com" />
+      <root url="file://$USER_HOME$/home/GO_LIB/src/golang.org" />
+      <root url="file://$USER_HOME$/home/GO_LIB/src/gopkg.in" />
+    </CLASSES>
+    <JAVADOC />
+    <SOURCES>
+      <root url="file://$USER_HOME$/home/GO_LIB/src/k8s.io" />
+      <root url="file://$USER_HOME$/home/GO_LIB/src/git.torproject.org" />
+      <root url="file://$USER_HOME$/home/GO_LIB/src/github.com" />
+      <root url="file://$USER_HOME$/home/GO_LIB/src/golang.org" />
+      <root url="file://$USER_HOME$/home/GO_LIB/src/gopkg.in" />
+    </SOURCES>
+    <excluded>
+      <root url="file://$PROJECT_DIR$" />
+    </excluded>
+  </library>
+</component>

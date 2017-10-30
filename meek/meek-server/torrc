@@ -1,0 +1,7 @@
+BridgeRelay 1
+ORPort 9001
+ExtORPort auto
+SocksPort 0
+ServerTransportListenAddr meek 0.0.0.0:7002
+ServerTransportPlugin meek exec ./meek-server --log meek-server.log --cert cert.pem --key key.pem
+ExitPolicy reject *:*
